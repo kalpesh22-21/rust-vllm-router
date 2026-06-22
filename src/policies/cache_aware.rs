@@ -981,4 +981,97 @@ mod tests {
             "model-beta tree must remain"
         );
     }
+
+    // ===== Repro: "This is a cat" / "This is a dog" cache behavior =====
+
+    /// The radix tree itself correctly caches BOTH divergent-suffix strings.
+    /// This exonerates the tree: it is NOT dropping "This is a dog".
+    #[test]
+    fn repro_tree_caches_both_divergent_prefixes() {
+        let tree = Tree::new();
+        tree.insert("This is a cat", "w1");
+        tree.insert("This is a dog", "w2");
+
+        let r1 = tree.prefix_match_with_counts("This is a cat");
+        assert_eq!(r1.matched_char_count, 13, "cat should fully match");
+        assert_eq!(&*r1.tenant, "w1");
+
+        let r2 = tree.prefix_match_with_counts("This is a dog");
+        assert_eq!(r2.matched_char_count, 13, "dog should fully match — it IS cached");
+        assert_eq!(&*r2.tenant, "w2");
+
+        // A third divergent suffix shares the 10-char "This is a " prefix.
+        let r3 = tree.prefix_match_with_counts("This is a fox");
+        assert_eq!(r3.matched_char_count, 10, "shared 'This is a ' prefix");
+    }
+
+    fn two_workers() -> Vec<Arc<dyn Worker>> {
+        vec![
+            Arc::new(BasicWorker::new(
+                "http://w1:8000".to_string(),
+                WorkerType::Regular,
+            )),
+            Arc::new(BasicWorker::new(
+                "http://w2:8000".to_string(),
+                WorkerType::Regular,
+            )),
+        ]
+    }
+
+    fn cfg(small_request_token_threshold: usize) -> CacheAwareConfig {
+        CacheAwareConfig {
+            cache_threshold: 0.3,
+            balance_abs_threshold: 32,
+            balance_rel_threshold: 1.5,
+            eviction_interval_secs: 0,
+            max_tree_size: 100_000,
+            small_request_token_threshold,
+            kv_util_threshold: 0.9,
+            alpha: 0.7,
+            beta: 0.3,
+        }
+    }
+
+    /// With the DEFAULT threshold (25000), both tiny prompts hit the small-request
+    /// bypass → load-based selection → they are spread to DIFFERENT workers, so the
+    /// shared "This is a " prefix cached by req1 is NOT reused by req2.
+    #[test]
+    fn repro_small_request_bypass_breaks_affinity() {
+        let policy = CacheAwarePolicy::with_config(cfg(25_000));
+        let workers = two_workers();
+        policy.init_workers(&workers);
+
+        let idx1 = policy
+            .select_worker_with_headers(&workers, Some("This is a cat"), None)
+            .unwrap();
+        let idx2 = policy
+            .select_worker_with_headers(&workers, Some("This is a dog"), None)
+            .unwrap();
+
+        assert_ne!(
+            idx1, idx2,
+            "default 25000-token bypass spreads tiny prompts across workers (no cache affinity)"
+        );
+    }
+
+    /// With the bypass DISABLED (threshold 0), the cache-aware prefix path runs and
+    /// req2 follows req1 to the SAME worker via the shared "This is a " prefix.
+    #[test]
+    fn repro_affinity_works_when_bypass_disabled() {
+        let policy = CacheAwarePolicy::with_config(cfg(0));
+        let workers = two_workers();
+        policy.init_workers(&workers);
+
+        let idx1 = policy
+            .select_worker_with_headers(&workers, Some("This is a cat"), None)
+            .unwrap();
+        let idx2 = policy
+            .select_worker_with_headers(&workers, Some("This is a dog"), None)
+            .unwrap();
+
+        assert_eq!(
+            idx1, idx2,
+            "with bypass off, shared prefix routes req2 to req1's worker (cache hit)"
+        );
+    }
 }

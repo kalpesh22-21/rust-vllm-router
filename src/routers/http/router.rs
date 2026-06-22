@@ -925,20 +925,14 @@ impl Router {
                     response
                 }
                 Err(e) => {
-                    // IMPORTANT: Decrement load on error before returning
-                    if load_incremented {
-                        if let Some(worker) = self.worker_registry.get_by_url(worker_url) {
-                            worker.decrement_load();
-                            RouterMetrics::set_running_requests(worker_url, worker.load());
-                        }
-                    }
-
                     let error_msg = format!("Failed to get response body: {}", e);
                     (StatusCode::INTERNAL_SERVER_ERROR, error_msg).into_response()
                 }
             };
 
-            // Decrement load counter for non-streaming requests if it was incremented
+            // Decrement load counter for non-streaming requests if it was incremented.
+            // This runs for both the success and error arms above, so load is released
+            // exactly once on every non-streaming exit path.
             if load_incremented {
                 if let Some(worker) = self.worker_registry.get_by_url(worker_url) {
                     worker.decrement_load();
@@ -967,37 +961,51 @@ impl Router {
                 let mut stream = stream;
                 let mut decremented = false;
                 let mut first_chunk = true;
-                while let Some(chunk) = stream.next().await {
-                    match chunk {
-                        Ok(bytes) => {
-                            // Log streaming start on first chunk
-                            if first_chunk {
-                                first_chunk = false;
-                                let elapsed_ms = request_received_at.elapsed().as_millis();
-                                debug!(
-                                    "Streaming started from pod: worker={} route={} elapsed_ms={} request_id={:?}",
-                                    worker_url, route, elapsed_ms, request_id
-                                );
-                            }
-                            // Check for stream end marker
-                            if bytes
-                                .as_ref()
-                                .windows(12)
-                                .any(|window| window == b"data: [DONE]")
-                            {
-                                if let Some(worker) = registry.get_by_url(&worker_url) {
-                                    worker.decrement_load();
-                                    RouterMetrics::set_running_requests(&worker_url, worker.load());
-                                    decremented = true;
-                                }
-                            }
-                            if tx.send(Ok(bytes)).is_err() {
-                                break;
-                            }
-                        }
-                        Err(e) => {
-                            let _ = tx.send(Err(format!("Stream error: {}", e)));
+                loop {
+                    tokio::select! {
+                        biased;
+                        _ = tx.closed() => {
+                            // Downstream client disconnected: stop pulling tokens so the
+                            // worker's generation is cancelled (dropping `stream` on task
+                            // exit closes the upstream connection).
+                            debug!(
+                                "Client disconnected, cancelling upstream stream: worker={} route={} request_id={:?}",
+                                worker_url, route, request_id
+                            );
                             break;
+                        }
+                        maybe_chunk = stream.next() => {
+                            match maybe_chunk {
+                                Some(Ok(bytes)) => {
+                                    if first_chunk {
+                                        first_chunk = false;
+                                        let elapsed_ms = request_received_at.elapsed().as_millis();
+                                        debug!(
+                                            "Streaming started from pod: worker={} route={} elapsed_ms={} request_id={:?}",
+                                            worker_url, route, elapsed_ms, request_id
+                                        );
+                                    }
+                                    if bytes
+                                        .as_ref()
+                                        .windows(12)
+                                        .any(|window| window == b"data: [DONE]")
+                                    {
+                                        if let Some(worker) = registry.get_by_url(&worker_url) {
+                                            worker.decrement_load();
+                                            RouterMetrics::set_running_requests(&worker_url, worker.load());
+                                            decremented = true;
+                                        }
+                                    }
+                                    if tx.send(Ok(bytes)).is_err() {
+                                        break;
+                                    }
+                                }
+                                Some(Err(e)) => {
+                                    let _ = tx.send(Err(format!("Stream error: {}", e)));
+                                    break;
+                                }
+                                None => break,
+                            }
                         }
                     }
                 }
@@ -1034,25 +1042,41 @@ impl Router {
             tokio::spawn(async move {
                 let mut stream = stream;
                 let mut first_chunk = true;
-                while let Some(chunk) = stream.next().await {
-                    match chunk {
-                        Ok(bytes) => {
-                            // Log streaming start on first chunk
-                            if first_chunk {
-                                first_chunk = false;
-                                let elapsed_ms = request_received_at.elapsed().as_millis();
-                                debug!(
-                                    "Streaming started from pod: worker={} route={} elapsed_ms={} request_id={:?}",
-                                    worker_url, route, elapsed_ms, request_id
-                                );
-                            }
-                            if tx.send(Ok(bytes)).is_err() {
-                                break;
-                            }
-                        }
-                        Err(e) => {
-                            let _ = tx.send(Err(format!("Stream error: {}", e)));
+                loop {
+                    tokio::select! {
+                        biased;
+                        _ = tx.closed() => {
+                            // Downstream client disconnected: stop pulling tokens so the
+                            // worker's generation is cancelled (dropping `stream` on task
+                            // exit closes the upstream connection).
+                            debug!(
+                                "Client disconnected, cancelling upstream stream: worker={} route={} request_id={:?}",
+                                worker_url, route, request_id
+                            );
                             break;
+                        }
+                        maybe_chunk = stream.next() => {
+                            match maybe_chunk {
+                                Some(Ok(bytes)) => {
+                                    // Log streaming start on first chunk
+                                    if first_chunk {
+                                        first_chunk = false;
+                                        let elapsed_ms = request_received_at.elapsed().as_millis();
+                                        debug!(
+                                            "Streaming started from pod: worker={} route={} elapsed_ms={} request_id={:?}",
+                                            worker_url, route, elapsed_ms, request_id
+                                        );
+                                    }
+                                    if tx.send(Ok(bytes)).is_err() {
+                                        break;
+                                    }
+                                }
+                                Some(Err(e)) => {
+                                    let _ = tx.send(Err(format!("Stream error: {}", e)));
+                                    break;
+                                }
+                                None => break,
+                            }
                         }
                     }
                 }
@@ -2482,6 +2506,127 @@ mod tests {
         assert!(
             !cache_policy.has_tree_for_model(model_id),
             "cache tree must be removed after last worker is gone (non-DP branch)"
+        );
+    }
+
+    /// Test that the `select! { biased; _ = tx.closed() => break; ... }` pattern
+    /// used in both SSE-forwarder tasks terminates promptly when the downstream
+    /// receiver is dropped.
+    ///
+    /// The forwarder loop in `send_typed_request` cannot be called directly
+    /// because it is inline inside a `tokio::spawn` closure.  However the
+    /// observable contract is entirely expressed through the mpsc channel
+    /// primitives it uses:
+    ///
+    /// * `tx` is the *sender* kept by the spawned task;  `tx.closed()` resolves
+    ///   once every `rx` clone has been dropped.
+    /// * Dropping `rx` (the response-body stream on the axum side) therefore
+    ///   triggers `tx.closed()` inside the forwarder, which breaks the loop and
+    ///   drops the upstream `reqwest` stream — cancelling generation.
+    ///
+    /// This test reproduces that exact sequence using the same channel type
+    /// (`tokio::sync::mpsc::unbounded_channel`) and the same `select!` structure,
+    /// with a slow upstream replaced by an in-process channel that only yields
+    /// items on demand.
+    #[tokio::test]
+    async fn test_disconnect_cancels_sse_forwarder_loop() {
+        use futures_util::StreamExt;
+        use tokio::sync::mpsc;
+
+        // Simulate the upstream bytes stream with a channel we control.
+        let (upstream_tx, upstream_rx) = mpsc::unbounded_channel::<Result<bytes::Bytes, String>>();
+        let mut upstream_stream =
+            tokio_stream::wrappers::UnboundedReceiverStream::new(upstream_rx);
+
+        // This is the downstream channel created by `send_typed_request`.
+        let (forwarder_tx, forwarder_rx) = mpsc::unbounded_channel::<Result<bytes::Bytes, String>>();
+
+        // Track whether the forwarder task exited and whether it ran the
+        // post-loop decrement path (analogous to `if !decremented { ... }`).
+        let task_exited = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let post_loop_ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let task_exited_clone = task_exited.clone();
+        let post_loop_ran_clone = post_loop_ran.clone();
+
+        // Spawn the forwarder loop, mirroring both `select!` branches in
+        // `send_typed_request` (both load-tracking and non-load-tracking arms
+        // share identical structure; we test the common pattern here).
+        tokio::spawn(async move {
+            let mut decremented = false;
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = forwarder_tx.closed() => {
+                        // Downstream disconnected — break and let `upstream_stream`
+                        // drop, which closes the upstream reqwest connection.
+                        break;
+                    }
+                    maybe_chunk = upstream_stream.next() => {
+                        match maybe_chunk {
+                            Some(Ok(bytes)) => {
+                                // Simulate [DONE] detection that sets `decremented`.
+                                if bytes.as_ref() == b"data: [DONE]" {
+                                    decremented = true;
+                                }
+                                if forwarder_tx.send(Ok(bytes)).is_err() {
+                                    break;
+                                }
+                            }
+                            Some(Err(e)) => {
+                                let _ = forwarder_tx.send(Err(e));
+                                break;
+                            }
+                            None => break,
+                        }
+                    }
+                }
+            }
+            // Post-loop: always runs on every exit path.
+            if !decremented {
+                post_loop_ran_clone.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            task_exited_clone.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+
+        // Send one chunk upstream so the forwarder loop iterates at least once.
+        upstream_tx
+            .send(Ok(bytes::Bytes::from("data: {\"token\":\"hello\"}")))
+            .unwrap();
+
+        // Receive the forwarded chunk on the downstream side.
+        let mut downstream = tokio_stream::wrappers::UnboundedReceiverStream::new(forwarder_rx);
+        let first = downstream.next().await.expect("should receive first chunk");
+        assert!(first.is_ok());
+
+        // Simulate client disconnect: drop the downstream receiver.
+        // This makes `forwarder_tx.closed()` resolve on the next `select!` poll.
+        drop(downstream);
+
+        // Give the forwarder task time to observe the closed signal and exit.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // The task must have exited.
+        assert!(
+            task_exited.load(std::sync::atomic::Ordering::SeqCst),
+            "forwarder task must exit when downstream receiver is dropped"
+        );
+
+        // Because [DONE] was never sent, the post-loop cleanup path must have run
+        // (mirrors `if !decremented { worker.decrement_load(); }` in production).
+        assert!(
+            post_loop_ran.load(std::sync::atomic::Ordering::SeqCst),
+            "post-loop cleanup must run on disconnect exit path (load must be decremented)"
+        );
+
+        // The task exited by breaking out of the loop, which drops `upstream_stream`
+        // (the `UnboundedReceiverStream` that wraps `upstream_rx`).  Dropping the
+        // receiver causes `upstream_tx.is_closed()` to return true, which is the
+        // observable signal that the upstream connection has been abandoned —
+        // equivalent to the real reqwest stream being dropped and cancelling generation.
+        assert!(
+            upstream_tx.is_closed(),
+            "upstream receiver must be dropped when the forwarder task exits (cancels generation)"
         );
     }
 }

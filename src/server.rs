@@ -863,9 +863,25 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     );
 
     println!("DEBUG: Creating HTTP client");
+    // Connection-reuse is configurable so it can be disabled (set to 0) when
+    // diagnosing HTTP/1.1 keep-alive response desync across concurrent requests.
+    let pool_max_idle_per_host = match std::env::var("VLLM_ROUTER_POOL_MAX_IDLE_PER_HOST") {
+        Ok(v) => v.parse::<usize>().unwrap_or_else(|_| {
+            warn!(
+                "VLLM_ROUTER_POOL_MAX_IDLE_PER_HOST='{}' is not a valid usize; using default 500",
+                v
+            );
+            500
+        }),
+        Err(_) => 500,
+    };
+    info!(
+        "HTTP client pool_max_idle_per_host = {}",
+        pool_max_idle_per_host
+    );
     let client = Client::builder()
         .pool_idle_timeout(Some(Duration::from_secs(50)))
-        .pool_max_idle_per_host(500)
+        .pool_max_idle_per_host(pool_max_idle_per_host)
         .timeout(Duration::from_secs(config.request_timeout_secs))
         .connect_timeout(Duration::from_secs(10))
         .tcp_nodelay(true)

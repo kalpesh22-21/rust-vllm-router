@@ -51,7 +51,11 @@
       "Bash(tee /tmp/full_test_run.txt)",
       "Bash(tee /tmp/full_test_run2.txt)",
       "Bash(grep -E \"^Phase|PASSED|FAILED|ok$|panic|assertion\")",
-      "Bash(git -C /Users/kalpeshmulye/Development/vllm-router-rust diff)"
+      "Bash(git -C /Users/kalpeshmulye/Development/vllm-router-rust diff)",
+      "Bash(grep -E \"\\\\.\\(rs\\)$\")",
+      "Bash(git --no-pager diff --stat)",
+      "Bash(git --no-pager diff)",
+      "Bash(git --no-pager diff src/server.rs src/routers/http/router.rs)"
     ]
   }
 }
