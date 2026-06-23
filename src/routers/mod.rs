@@ -10,8 +10,8 @@ use axum::{
 use std::fmt::Debug;
 
 use crate::protocols::spec::{
-    ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest, RerankRequest,
-    ResponsesRequest,
+    ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest, MessagesRequest,
+    RerankRequest, ResponsesRequest,
 };
 
 pub mod factory;
@@ -87,6 +87,24 @@ pub trait RouterTrait: Send + Sync + Debug + WorkerManagement {
         body: &CompletionRequest,
         model_id: Option<&str>,
     ) -> Response;
+
+    /// Route an Anthropic-compatible Messages request (`POST /v1/messages`)
+    ///
+    /// The default returns 501 so routers that don't speak the Anthropic
+    /// Messages API (PD, gRPC, OpenAI passthrough) degrade gracefully. Routers
+    /// that support it (the regular HTTP router) override this method.
+    async fn route_messages(
+        &self,
+        _headers: Option<&HeaderMap>,
+        _body: &MessagesRequest,
+        _model_id: Option<&str>,
+    ) -> Response {
+        (
+            StatusCode::NOT_IMPLEMENTED,
+            "Messages API (/v1/messages) not supported by this router",
+        )
+            .into_response()
+    }
 
     /// Route a responses request
     async fn route_responses(

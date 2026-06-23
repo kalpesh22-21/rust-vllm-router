@@ -619,6 +619,112 @@ impl GenerationRequest for ChatCompletionRequest {
     }
 }
 
+// ============= Anthropic Messages API Request =============
+
+/// A single message in an Anthropic-compatible Messages request.
+///
+/// `content` is intentionally kept as a raw JSON value because the Anthropic
+/// format allows either a plain string or an array of typed content blocks
+/// (text, image, tool_use, tool_result, ...). The router only needs the text
+/// for routing decisions; everything else is forwarded to the worker verbatim.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct AnthropicMessage {
+    /// Message role: "user" or "assistant".
+    pub role: String,
+    /// Message content: a string or an array of content blocks.
+    pub content: serde_json::Value,
+}
+
+/// Extract plain-text fragments from an Anthropic content value (used only for
+/// routing). Handles both the bare-string form and the content-block-array form,
+/// pulling `text` out of every `{"type": "text", "text": ...}` block.
+fn anthropic_content_text(content: &serde_json::Value) -> Vec<String> {
+    let mut out = Vec::new();
+    match content {
+        serde_json::Value::String(s) => {
+            if !s.is_empty() {
+                out.push(s.clone());
+            }
+        }
+        serde_json::Value::Array(blocks) => {
+            for block in blocks {
+                if block.get("type").and_then(|t| t.as_str()) == Some("text") {
+                    if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
+                        if !text.is_empty() {
+                            out.push(text.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    out
+}
+
+/// Anthropic-compatible Messages API request (`POST /v1/messages`).
+///
+/// vLLM exposes an Anthropic-compatible Messages endpoint (the same API used by
+/// Claude Code and other Anthropic SDK clients). The router only needs `model`,
+/// `stream`, and the message/system text to make routing decisions; every other
+/// field is preserved verbatim via `extra` and forwarded to the worker unchanged.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct MessagesRequest {
+    /// ID of the model to use (optional; vLLM allows omitting it on single-model servers).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+
+    /// Input messages comprising the conversation so far.
+    pub messages: Vec<AnthropicMessage>,
+
+    /// Maximum number of tokens to generate (required by the Anthropic API).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u32>,
+
+    /// Optional system prompt (a string or an array of content blocks).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system: Option<serde_json::Value>,
+
+    /// Whether to stream the response as SSE events.
+    #[serde(default)]
+    pub stream: bool,
+
+    /// All remaining Anthropic fields (temperature, top_p, top_k, stop_sequences,
+    /// tools, tool_choice, metadata, thinking, ...) preserved verbatim so they are
+    /// forwarded to the worker without modification.
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
+impl GenerationRequest for MessagesRequest {
+    fn is_stream(&self) -> bool {
+        self.stream
+    }
+
+    fn get_model(&self) -> Option<&str> {
+        self.model.as_deref()
+    }
+
+    fn extract_text_for_routing(&self) -> String {
+        let mut all_texts: Vec<String> = Vec::new();
+
+        // System prompt first (string or content-block array), then every message
+        // in order, mirroring how ChatCompletionRequest builds its routing text.
+        if let Some(ref system) = self.system {
+            all_texts.extend(anthropic_content_text(system));
+        }
+        for msg in &self.messages {
+            all_texts.extend(anthropic_content_text(&msg.content));
+        }
+
+        if all_texts.is_empty() {
+            String::new()
+        } else {
+            all_texts.join(" ")
+        }
+    }
+}
+
 // ============= Regular Response =============
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -2434,6 +2540,59 @@ pub enum LoRAPath {
 mod tests {
     use super::*;
     use serde_json;
+
+    // ==================================================================
+    // =            MESSAGES (ANTHROPIC) REQUEST TESTS                  =
+    // ==================================================================
+
+    #[test]
+    fn test_messages_request_routing_text_string_and_blocks() {
+        // System as a string, one message with a plain string, one with content blocks.
+        let req: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "test-model",
+            "max_tokens": 64,
+            "system": "be helpful",
+            "messages": [
+                {"role": "user", "content": "hello there"},
+                {"role": "assistant", "content": [
+                    {"type": "text", "text": "general kenobi"},
+                    {"type": "image", "source": {"type": "base64", "data": "..."}}
+                ]}
+            ]
+        }))
+        .unwrap();
+
+        assert!(req.is_stream() == false);
+        assert_eq!(req.get_model(), Some("test-model"));
+        // System text first, then each message's text blocks in order; images ignored.
+        assert_eq!(
+            req.extract_text_for_routing(),
+            "be helpful hello there general kenobi"
+        );
+    }
+
+    #[test]
+    fn test_messages_request_preserves_extra_fields_on_roundtrip() {
+        // Fields the router doesn't model (tools, temperature, stop_sequences, ...)
+        // must survive serialization so they are forwarded to the worker verbatim.
+        let original = serde_json::json!({
+            "model": "test-model",
+            "max_tokens": 128,
+            "stream": true,
+            "messages": [{"role": "user", "content": "hi"}],
+            "temperature": 0.5,
+            "stop_sequences": ["\n\n"],
+            "tools": [{"name": "get_weather", "description": "..."}],
+            "metadata": {"user_id": "abc"}
+        });
+
+        let req: MessagesRequest = serde_json::from_value(original.clone()).unwrap();
+        assert!(req.is_stream());
+        assert_eq!(req.max_tokens, Some(128));
+
+        let reserialized = serde_json::to_value(&req).unwrap();
+        assert_eq!(reserialized, original);
+    }
 
     // ==================================================================
     // =            RERANK REQUEST TESTS                                =

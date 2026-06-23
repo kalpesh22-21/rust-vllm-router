@@ -81,6 +81,7 @@ impl MockWorker {
             .route("/get_model_info", get(model_info_handler))
             .route("/generate", post(generate_handler))
             .route("/v1/chat/completions", post(chat_completions_handler))
+            .route("/v1/messages", post(messages_handler))
             .route("/v1/completions", post(completions_handler))
             .route("/v1/rerank", post(rerank_handler))
             .route("/v1/responses", post(responses_handler))
@@ -478,6 +479,104 @@ async fn chat_completions_handler(
                 "prompt_tokens": 10,
                 "completion_tokens": 5,
                 "total_tokens": 15
+            }
+        }))
+        .into_response()
+    }
+}
+
+async fn messages_handler(
+    State(config): State<Arc<RwLock<MockWorkerConfig>>>,
+    headers: axum::http::HeaderMap,
+    Json(payload): Json<serde_json::Value>,
+) -> Response {
+    let config = config.read().await;
+
+    // Capture request for test inspection
+    capture_request(config.port, "/v1/messages", &headers);
+
+    if should_fail(&config).await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({
+                "type": "error",
+                "error": {
+                    "type": "internal_error",
+                    "message": "Random failure for testing"
+                }
+            })),
+        )
+            .into_response();
+    }
+
+    if config.response_delay_ms > 0 {
+        tokio::time::sleep(tokio::time::Duration::from_millis(config.response_delay_ms)).await;
+    }
+
+    let is_stream = payload
+        .get("stream")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    let message_id = format!("msg_{}", Uuid::new_v4());
+
+    if is_stream {
+        // Minimal Anthropic-style SSE event sequence. Unlike the OpenAI format,
+        // the Anthropic stream terminates with `message_stop` (no `[DONE]` marker).
+        let id_for_start = message_id.clone();
+        let stream = stream::once(async move {
+            Ok::<_, Infallible>(
+                Event::default().event("message_start").data(
+                    json!({
+                        "type": "message_start",
+                        "message": {
+                            "id": id_for_start,
+                            "type": "message",
+                            "role": "assistant",
+                            "model": "mock-model",
+                            "content": [],
+                            "stop_reason": null,
+                            "usage": {"input_tokens": 10, "output_tokens": 0}
+                        }
+                    })
+                    .to_string(),
+                ),
+            )
+        })
+        .chain(stream::once(async {
+            Ok(Event::default().event("content_block_delta").data(
+                json!({
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": {"type": "text_delta", "text": "This is a mock Anthropic response."}
+                })
+                .to_string(),
+            ))
+        }))
+        .chain(stream::once(async {
+            Ok(Event::default()
+                .event("message_stop")
+                .data(json!({"type": "message_stop"}).to_string()))
+        }));
+
+        Sse::new(stream)
+            .keep_alive(KeepAlive::default())
+            .into_response()
+    } else {
+        Json(json!({
+            "id": message_id,
+            "type": "message",
+            "role": "assistant",
+            "model": "mock-model",
+            "content": [{
+                "type": "text",
+                "text": "This is a mock Anthropic response."
+            }],
+            "stop_reason": "end_turn",
+            "stop_sequence": null,
+            "usage": {
+                "input_tokens": 10,
+                "output_tokens": 5
             }
         }))
         .into_response()

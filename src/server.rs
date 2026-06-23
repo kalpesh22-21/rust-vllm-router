@@ -9,7 +9,7 @@ use crate::{
     protocols::{
         spec::{
             ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest,
-            RerankRequest, V1RerankReqInput,
+            MessagesRequest, RerankRequest, V1RerankReqInput,
         },
         worker_spec::{WorkerApiResponse, WorkerConfigRequest, WorkerErrorResponse},
     },
@@ -276,6 +276,21 @@ async fn v1_completions(
     state
         .router
         .route_completion(Some(&headers), &body, None)
+        .await
+}
+
+async fn v1_messages(
+    State(state): State<Arc<AppState>>,
+    headers: http::HeaderMap,
+    Json(body): Json<MessagesRequest>,
+) -> Response {
+    if let Err(response) = authorize_request(&state, &headers).await {
+        return response;
+    }
+
+    state
+        .router
+        .route_messages(Some(&headers), &body, None)
         .await
 }
 
@@ -732,6 +747,7 @@ pub fn build_app_with_request_tracing(
         .route("/generate", post(generate))
         .route("/v1/chat/completions", post(v1_chat_completions))
         .route("/v1/completions", post(v1_completions))
+        .route("/v1/messages", post(v1_messages))
         .route("/rerank", post(rerank))
         .route("/v1/rerank", post(v1_rerank))
         .route("/v1/responses", post(v1_responses))

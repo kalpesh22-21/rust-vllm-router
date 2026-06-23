@@ -8,7 +8,7 @@ use crate::otel_http::{self, ClientRequestOptions};
 use crate::policies::{LoadBalancingPolicy, PolicyRegistry};
 use crate::protocols::spec::{
     ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest, GenerationRequest,
-    RerankRequest, RerankResponse, RerankResult, ResponsesRequest,
+    MessagesRequest, RerankRequest, RerankResponse, RerankResult, ResponsesRequest,
 };
 use crate::routers::header_utils;
 use crate::routers::http::dp_utils;
@@ -1580,6 +1580,16 @@ impl RouterTrait for Router {
         model_id: Option<&str>,
     ) -> Response {
         self.route_typed_request(headers, body, "/v1/completions", model_id)
+            .await
+    }
+
+    async fn route_messages(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &MessagesRequest,
+        model_id: Option<&str>,
+    ) -> Response {
+        self.route_typed_request(headers, body, "/v1/messages", model_id)
             .await
     }
 

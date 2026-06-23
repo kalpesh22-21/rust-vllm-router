@@ -7,8 +7,8 @@
 use crate::config::RouterConfig;
 use crate::core::{CircuitBreakerConfig, Worker, WorkerFactory, WorkerRegistry, WorkerType};
 use crate::protocols::spec::{
-    ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest, RerankRequest,
-    ResponsesRequest,
+    ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest, MessagesRequest,
+    RerankRequest, ResponsesRequest,
 };
 use crate::protocols::worker_spec::{
     ServerInfo, WorkerApiResponse, WorkerConfigRequest, WorkerErrorResponse, WorkerInfo,
@@ -622,6 +622,28 @@ impl RouterTrait for RouterManager {
 
         if let Some(router) = router {
             router.route_chat(headers, body, model_id).await
+        } else {
+            let msg = match model_id {
+                Some(m) => format!("Model '{}' not found or no router available", m),
+                None => "No routers registered to handle this request".to_string(),
+            };
+            (StatusCode::NOT_FOUND, msg).into_response()
+        }
+    }
+
+    /// Route an Anthropic-compatible Messages request
+    async fn route_messages(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &MessagesRequest,
+        _model_id: Option<&str>,
+    ) -> Response {
+        // Mirror route_chat: select a router by header/model, then delegate.
+        let model_id = body.model.as_deref();
+        let router = self.select_router_for_request(headers, model_id);
+
+        if let Some(router) = router {
+            router.route_messages(headers, body, model_id).await
         } else {
             let msg = match model_id {
                 Some(m) => format!("Model '{}' not found or no router available", m),
