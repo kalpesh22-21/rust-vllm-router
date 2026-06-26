@@ -255,13 +255,23 @@ async fn generate(
 async fn v1_chat_completions(
     State(state): State<Arc<AppState>>,
     headers: http::HeaderMap,
-    Json(body): Json<ChatCompletionRequest>,
+    body: axum::body::Bytes,
 ) -> Response {
     if let Err(response) = authorize_request(&state, &headers).await {
         return response;
     }
 
-    state.router.route_chat(Some(&headers), &body, None).await
+    let parsed: ChatCompletionRequest = match serde_json::from_slice(&body) {
+        Ok(p) => p,
+        Err(e) => {
+            return (StatusCode::BAD_REQUEST, format!("Invalid JSON: {e}")).into_response()
+        }
+    };
+
+    state
+        .router
+        .route_chat(Some(&headers), &parsed, None, Some(body))
+        .await
 }
 
 async fn v1_completions(

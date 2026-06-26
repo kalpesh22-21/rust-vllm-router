@@ -612,6 +612,7 @@ impl RouterTrait for RouterManager {
         headers: Option<&HeaderMap>,
         body: &ChatCompletionRequest,
         _model_id: Option<&str>,
+        raw_body: Option<bytes::Bytes>,
     ) -> Response {
         // Select router based on headers and model.
         // When model is None, select_router_for_request considers all registered
@@ -621,7 +622,7 @@ impl RouterTrait for RouterManager {
         let router = self.select_router_for_request(headers, model_id);
 
         if let Some(router) = router {
-            router.route_chat(headers, body, model_id).await
+            router.route_chat(headers, body, model_id, raw_body).await
         } else {
             let msg = match model_id {
                 Some(m) => format!("Model '{}' not found or no router available", m),

@@ -266,6 +266,7 @@ impl RouterTrait for GrpcPDRouter {
         _headers: Option<&HeaderMap>,
         _body: &crate::protocols::spec::ChatCompletionRequest,
         _model_id: Option<&str>,
+        _raw_body: Option<bytes::Bytes>,
     ) -> Response {
         (StatusCode::NOT_IMPLEMENTED).into_response()
     }

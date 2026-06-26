@@ -1208,6 +1208,7 @@ impl RouterTrait for VllmPDRouter {
         headers: Option<&HeaderMap>,
         body: &crate::protocols::spec::ChatCompletionRequest,
         _model_id: Option<&str>,
+        _raw_body: Option<bytes::Bytes>,
     ) -> Response {
         info!(
             "vLLM route_chat called, use_discovery={}",

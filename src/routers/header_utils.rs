@@ -4,6 +4,21 @@ use axum::http::HeaderMap;
 
 pub use crate::otel_http::TRACE_HEADER_NAMES;
 
+/// Session-identity header names forwarded to backends so they can perform
+/// session-aware work (e.g. continual prompting / session caching).
+///
+/// This mirrors the headers the consistent-hash policy uses for routing
+/// (see `policies::consistent_hash`), minus `x-request-id` and `x-trace-id`,
+/// which are owned by the trace/OTel layer (`propagate_trace_headers` /
+/// `send_client_request`) and are injected/replaced there rather than
+/// forwarded verbatim.
+pub const SESSION_HEADER_NAMES: &[&str] = &[
+    "x-session-id",
+    "x-user-id",
+    "x-tenant-id",
+    "x-correlation-id",
+];
+
 /// Copy request headers to a Vec of name-value string pairs
 /// Used for forwarding headers to backend workers
 pub fn copy_request_headers(req: &Request<Body>) -> Vec<(String, String)> {

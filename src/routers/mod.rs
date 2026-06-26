@@ -78,6 +78,7 @@ pub trait RouterTrait: Send + Sync + Debug + WorkerManagement {
         headers: Option<&HeaderMap>,
         body: &ChatCompletionRequest,
         model_id: Option<&str>,
+        raw_body: Option<bytes::Bytes>,
     ) -> Response;
 
     /// Route a completion request

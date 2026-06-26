@@ -214,6 +214,7 @@ impl super::super::RouterTrait for OpenAIRouter {
         headers: Option<&HeaderMap>,
         body: &ChatCompletionRequest,
         _model_id: Option<&str>,
+        _raw_body: Option<bytes::Bytes>,
     ) -> Response {
         if !self.circuit_breaker.can_execute() {
             return (StatusCode::SERVICE_UNAVAILABLE, "Circuit breaker open").into_response();
@@ -264,6 +265,15 @@ impl super::super::RouterTrait for OpenAIRouter {
             }
         }
 
+        // Forward session-identity headers so the backend can do session-aware
+        // work. Trace headers (incl. x-request-id) are handled by the OTel layer
+        // in send_client_request below, so they are intentionally excluded here.
+        req = crate::routers::header_utils::propagate_headers(
+            req,
+            headers,
+            crate::routers::header_utils::SESSION_HEADER_NAMES,
+        );
+
         // Accept SSE when stream=true
         if body.stream {
             req = req.header("Accept", "text/event-stream");
@@ -306,6 +316,9 @@ impl super::super::RouterTrait for OpenAIRouter {
                     if let Some(ct) = content_type {
                         response.headers_mut().insert(CONTENT_TYPE, ct);
                     }
+                    if let Ok(worker_value) = HeaderValue::from_str(&self.base_url) {
+                        response.headers_mut().insert("x-worker-url", worker_value);
+                    }
                     response
                 }
                 Err(e) => {
@@ -344,6 +357,9 @@ impl super::super::RouterTrait for OpenAIRouter {
             response
                 .headers_mut()
                 .insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
+            if let Ok(worker_value) = HeaderValue::from_str(&self.base_url) {
+                response.headers_mut().insert("x-worker-url", worker_value);
+            }
             response
         }
     }

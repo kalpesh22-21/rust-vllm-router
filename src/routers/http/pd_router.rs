@@ -2049,6 +2049,7 @@ impl RouterTrait for PDRouter {
         headers: Option<&HeaderMap>,
         body: &ChatCompletionRequest,
         model_id: Option<&str>,
+        _raw_body: Option<bytes::Bytes>,
     ) -> Response {
         // Extract parameters
         let is_stream = body.stream;

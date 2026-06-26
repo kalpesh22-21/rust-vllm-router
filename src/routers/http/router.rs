@@ -14,6 +14,7 @@ use crate::routers::header_utils;
 use crate::routers::http::dp_utils;
 use crate::routers::{RouterTrait, WorkerManagement};
 use axum::body::to_bytes;
+use axum::body::Bytes;
 use axum::{
     body::Body,
     extract::Request,
@@ -46,6 +47,79 @@ pub struct Router {
     circuit_breaker_config: CircuitBreakerConfig,
     _worker_loads: Arc<tokio::sync::watch::Receiver<HashMap<String, isize>>>,
     _load_monitor_handle: Option<Arc<tokio::task::JoinHandle<()>>>,
+}
+
+/// Re-frames a raw upstream SSE byte stream onto event boundaries.
+///
+/// `reqwest::bytes_stream()` yields whatever bytes are available per read, which
+/// frequently coalesces several SSE events (or splits one) into a single chunk —
+/// e.g. vLLM flushes a tool-call tail (`finish_reason` → usage → `data: [DONE]`)
+/// in one network write. Forwarding that coalesced chunk as a single HTTP body
+/// frame breaks naive downstream consumers that assume one event per read. This
+/// buffer accumulates bytes and hands back complete events (terminated by `\n\n`
+/// or `\r\n\r\n`) so every forwarded frame ends exactly on an event boundary.
+/// Content and ordering are preserved byte-for-byte; only the chunk boundaries
+/// change — the concatenation of all yielded events (plus the final `flush`)
+/// equals the concatenation of all pushed input.
+struct SseReframer {
+    buf: Vec<u8>,
+}
+
+impl SseReframer {
+    /// Safety cap on a single buffered (unterminated) event. Prevents unbounded
+    /// buffering / head-of-line stalling if an upstream ever sends non-SSE data
+    /// on the streaming path; the partial buffer is flushed as-is past this size.
+    const MAX_EVENT_BYTES: usize = 256 * 1024;
+
+    fn new() -> Self {
+        Self { buf: Vec::new() }
+    }
+
+    /// Append `bytes` and return every complete event now available, each ending
+    /// on its `\n\n` / `\r\n\r\n` terminator. A safety flush occurs if the buffer
+    /// grows past `MAX_EVENT_BYTES` without a boundary.
+    fn push(&mut self, bytes: &[u8]) -> Vec<Bytes> {
+        self.buf.extend_from_slice(bytes);
+        let mut events = Vec::new();
+        loop {
+            match Self::boundary_end(&self.buf) {
+                Some(end) => {
+                    let event: Vec<u8> = self.buf.drain(..end).collect();
+                    events.push(Bytes::from(event));
+                }
+                None => {
+                    if self.buf.len() > Self::MAX_EVENT_BYTES {
+                        events.push(Bytes::from(std::mem::take(&mut self.buf)));
+                    }
+                    break;
+                }
+            }
+        }
+        events
+    }
+
+    /// Return any bytes still buffered (a final event without a trailing
+    /// terminator). Must be called once the upstream stream ends so the last
+    /// event is never dropped.
+    fn flush(&mut self) -> Option<Bytes> {
+        if self.buf.is_empty() {
+            None
+        } else {
+            Some(Bytes::from(std::mem::take(&mut self.buf)))
+        }
+    }
+
+    /// Index just past the first event terminator (`\n\n` or `\r\n\r\n`), if any.
+    fn boundary_end(buf: &[u8]) -> Option<usize> {
+        let lf = buf.windows(2).position(|w| w == b"\n\n").map(|i| i + 2);
+        let crlf = buf.windows(4).position(|w| w == b"\r\n\r\n").map(|i| i + 4);
+        match (lf, crlf) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        }
+    }
 }
 
 impl Router {
@@ -544,6 +618,7 @@ impl Router {
         typed_req: &T,
         route: &str,
         model_id: Option<&str>,
+        raw_body: Option<Bytes>,
     ) -> Response {
         let start = Instant::now();
         let request_received_at = Instant::now();
@@ -597,7 +672,7 @@ impl Router {
                     None
                 };
 
-                let response = self
+                let mut response = self
                     .send_typed_request(
                         headers,
                         typed_req,
@@ -607,8 +682,19 @@ impl Router {
                         load_incremented,
                         request_received_at,
                         request_id.as_deref(),
+                        raw_body.clone(),
                     )
                     .await;
+
+                // Surface which worker served this request so callers can see
+                // the routing decision. Uses the base URL (DP suffix stripped).
+                if let Ok(worker_value) =
+                    HeaderValue::from_str(&self.worker_base_url(worker.url()))
+                {
+                    response
+                        .headers_mut()
+                        .insert("x-worker-url", worker_value);
+                }
 
                 // Client errors (4xx) are not worker failures - only server errors (5xx)
                 // should count against the circuit breaker. This matches pd_router.rs behavior.
@@ -787,6 +873,7 @@ impl Router {
         load_incremented: bool, // Whether load was incremented for this request
         request_received_at: Instant,
         request_id: Option<&str>,
+        raw_body: Option<Bytes>,
     ) -> Response {
         // Log request received with worker and route info
         debug!(
@@ -808,37 +895,46 @@ impl Router {
                     }
                 };
 
-                // Parse the request body
-                let json_val = match serde_json::to_value(typed_req) {
-                    Ok(j) => j,
-                    Err(e) => {
-                        return (
-                            StatusCode::BAD_REQUEST,
-                            format!("Convert into serde_json::Value failed: {}", e),
-                        )
-                            .into_response();
+                let request_url = format!("{}{}", worker_url_prefix, route);
+                let builder = match raw_body {
+                    Some(b) => self
+                        .client
+                        .post(&request_url)
+                        .body(b)
+                        .header(CONTENT_TYPE, HeaderValue::from_static("application/json")),
+                    None => {
+                        // Parse the request body
+                        let json_val = match serde_json::to_value(typed_req) {
+                            Ok(j) => j,
+                            Err(e) => {
+                                return (
+                                    StatusCode::BAD_REQUEST,
+                                    format!("Convert into serde_json::Value failed: {}", e),
+                                )
+                                    .into_response();
+                            }
+                        };
+                        self.client.post(&request_url).json(&json_val)
                     }
                 };
-
-                // Use the original json_val without modification
-
-                let request_url = format!("{}{}", worker_url_prefix, route);
-                (
-                    self.client.post(&request_url).json(&json_val),
-                    Some(dp_rank),
-                    request_url,
-                )
+                (builder, Some(dp_rank), request_url)
             } else {
                 let request_url = format!("{}{}", worker_url, route);
-                (
-                    self.client.post(&request_url).json(typed_req),
-                    None,
-                    request_url,
-                )
+                let builder = match raw_body {
+                    Some(b) => self
+                        .client
+                        .post(&request_url)
+                        .body(b)
+                        .header(CONTENT_TYPE, HeaderValue::from_static("application/json")),
+                    None => self.client.post(&request_url).json(typed_req),
+                };
+                (builder, None, request_url)
             };
 
         // Copy all headers from original request if provided, skipping:
-        //   - Content-Type/Content-Length (.json() sets them)
+        //   - Content-Type/Content-Length (.json(), or the .body() + explicit
+        //     Content-Type header on the raw-passthrough path, set them; reqwest
+        //     derives Content-Length from the forwarded bytes)
         //   - Trace headers (propagate_trace_headers below injects fresh context)
         //   - x-request-id (replaced below with a guaranteed-unique UUID so that
         //     concurrent requests with the same client-supplied id cannot collide
@@ -959,8 +1055,31 @@ impl Router {
             // Spawn task to forward stream and detect completion
             tokio::spawn(async move {
                 let mut stream = stream;
+                let mut reframer = SseReframer::new();
                 let mut decremented = false;
                 let mut first_chunk = true;
+
+                // Release load the first time a fully-framed `data: [DONE]` event is
+                // forwarded (or at stream end). Checking per complete event — rather
+                // than per raw network chunk — keeps detection accurate even when the
+                // upstream coalesces the terminal with preceding content.
+                macro_rules! maybe_release_on_done {
+                    ($event:expr) => {
+                        if !decremented
+                            && $event
+                                .as_ref()
+                                .windows(12)
+                                .any(|window| window == b"data: [DONE]")
+                        {
+                            if let Some(worker) = registry.get_by_url(&worker_url) {
+                                worker.decrement_load();
+                                RouterMetrics::set_running_requests(&worker_url, worker.load());
+                                decremented = true;
+                            }
+                        }
+                    };
+                }
+
                 loop {
                     tokio::select! {
                         biased;
@@ -985,18 +1104,18 @@ impl Router {
                                             worker_url, route, elapsed_ms, request_id
                                         );
                                     }
-                                    if bytes
-                                        .as_ref()
-                                        .windows(12)
-                                        .any(|window| window == b"data: [DONE]")
-                                    {
-                                        if let Some(worker) = registry.get_by_url(&worker_url) {
-                                            worker.decrement_load();
-                                            RouterMetrics::set_running_requests(&worker_url, worker.load());
-                                            decremented = true;
+                                    // Re-frame onto SSE event boundaries so a coalesced
+                                    // multi-event chunk reaches the client as separate
+                                    // `\n\n`-terminated events, in order.
+                                    let mut disconnected = false;
+                                    for event in reframer.push(&bytes) {
+                                        maybe_release_on_done!(event);
+                                        if tx.send(Ok(event)).is_err() {
+                                            disconnected = true;
+                                            break;
                                         }
                                     }
-                                    if tx.send(Ok(bytes)).is_err() {
+                                    if disconnected {
                                         break;
                                     }
                                 }
@@ -1004,7 +1123,16 @@ impl Router {
                                     let _ = tx.send(Err(format!("Stream error: {}", e)));
                                     break;
                                 }
-                                None => break,
+                                None => {
+                                    // Upstream finished: flush any trailing event that
+                                    // arrived without a terminating blank line so it is
+                                    // never dropped.
+                                    if let Some(event) = reframer.flush() {
+                                        maybe_release_on_done!(event);
+                                        let _ = tx.send(Ok(event));
+                                    }
+                                    break;
+                                }
                             }
                         }
                     }
@@ -1041,6 +1169,7 @@ impl Router {
             // Spawn task to forward stream
             tokio::spawn(async move {
                 let mut stream = stream;
+                let mut reframer = SseReframer::new();
                 let mut first_chunk = true;
                 loop {
                     tokio::select! {
@@ -1067,7 +1196,15 @@ impl Router {
                                             worker_url, route, elapsed_ms, request_id
                                         );
                                     }
-                                    if tx.send(Ok(bytes)).is_err() {
+                                    // Re-frame onto SSE event boundaries before forwarding.
+                                    let mut disconnected = false;
+                                    for event in reframer.push(&bytes) {
+                                        if tx.send(Ok(event)).is_err() {
+                                            disconnected = true;
+                                            break;
+                                        }
+                                    }
+                                    if disconnected {
                                         break;
                                     }
                                 }
@@ -1075,7 +1212,13 @@ impl Router {
                                     let _ = tx.send(Err(format!("Stream error: {}", e)));
                                     break;
                                 }
-                                None => break,
+                                None => {
+                                    // Flush any trailing event without a terminator.
+                                    if let Some(event) = reframer.flush() {
+                                        let _ = tx.send(Ok(event));
+                                    }
+                                    break;
+                                }
                             }
                         }
                     }
@@ -1559,7 +1702,7 @@ impl RouterTrait for Router {
         body: &GenerateRequest,
         model_id: Option<&str>,
     ) -> Response {
-        self.route_typed_request(headers, body, "/generate", model_id)
+        self.route_typed_request(headers, body, "/generate", model_id, None)
             .await
     }
 
@@ -1568,8 +1711,9 @@ impl RouterTrait for Router {
         headers: Option<&HeaderMap>,
         body: &ChatCompletionRequest,
         model_id: Option<&str>,
+        raw_body: Option<bytes::Bytes>,
     ) -> Response {
-        self.route_typed_request(headers, body, "/v1/chat/completions", model_id)
+        self.route_typed_request(headers, body, "/v1/chat/completions", model_id, raw_body)
             .await
     }
 
@@ -1579,7 +1723,7 @@ impl RouterTrait for Router {
         body: &CompletionRequest,
         model_id: Option<&str>,
     ) -> Response {
-        self.route_typed_request(headers, body, "/v1/completions", model_id)
+        self.route_typed_request(headers, body, "/v1/completions", model_id, None)
             .await
     }
 
@@ -1589,7 +1733,7 @@ impl RouterTrait for Router {
         body: &MessagesRequest,
         model_id: Option<&str>,
     ) -> Response {
-        self.route_typed_request(headers, body, "/v1/messages", model_id)
+        self.route_typed_request(headers, body, "/v1/messages", model_id, None)
             .await
     }
 
@@ -1599,7 +1743,7 @@ impl RouterTrait for Router {
         body: &ResponsesRequest,
         model_id: Option<&str>,
     ) -> Response {
-        self.route_typed_request(headers, body, "/v1/responses", model_id)
+        self.route_typed_request(headers, body, "/v1/responses", model_id, None)
             .await
     }
 
@@ -1622,7 +1766,7 @@ impl RouterTrait for Router {
         // Record embeddings-specific metrics in addition to general request metrics
         let start = Instant::now();
         let res = self
-            .route_typed_request(headers, body, "/v1/embeddings", model_id)
+            .route_typed_request(headers, body, "/v1/embeddings", model_id, None)
             .await;
 
         // Embedding specific metrics
@@ -1647,7 +1791,7 @@ impl RouterTrait for Router {
             return (StatusCode::BAD_REQUEST, e).into_response();
         }
         let response = self
-            .route_typed_request(headers, body, "/v1/rerank", model_id)
+            .route_typed_request(headers, body, "/v1/rerank", model_id, None)
             .await;
         if response.status().is_success() {
             match Self::build_rerank_response(body, response).await {
@@ -1892,6 +2036,98 @@ impl RouterTrait for Router {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    // ============================================================
+    // =                  SseReframer tests                       =
+    // ============================================================
+
+    /// Collect the events produced by pushing `chunks` through the reframer,
+    /// then flushing. Returns the per-event byte vectors as `String`s.
+    fn reframe(chunks: &[&[u8]]) -> Vec<String> {
+        let mut r = SseReframer::new();
+        let mut out: Vec<String> = Vec::new();
+        for chunk in chunks {
+            for event in r.push(chunk) {
+                out.push(String::from_utf8(event.to_vec()).unwrap());
+            }
+        }
+        if let Some(rest) = r.flush() {
+            out.push(String::from_utf8(rest.to_vec()).unwrap());
+        }
+        out
+    }
+
+    #[test]
+    fn test_reframer_single_event() {
+        let events = reframe(&[b"data: {\"a\":1}\n\n"]);
+        assert_eq!(events, vec!["data: {\"a\":1}\n\n"]);
+    }
+
+    #[test]
+    fn test_reframer_splits_glued_tool_call_tail() {
+        // The exact failure mode: vLLM flushes the tool-call tail
+        // (finish_reason -> usage -> [DONE]) in a single network write. The
+        // reframer must hand them to the client as three separate, ordered,
+        // `\n\n`-terminated events with [DONE] strictly last.
+        let glued = b"data: {\"choices\":[{\"finish_reason\":\"tool_calls\"}]}\n\ndata: {\"choices\":[],\"usage\":{\"total_tokens\":42}}\n\ndata: [DONE]\n\n";
+        let events = reframe(&[glued]);
+        assert_eq!(events.len(), 3);
+        assert!(events[0].contains("\"finish_reason\":\"tool_calls\""));
+        assert!(events[0].ends_with("\n\n"));
+        assert!(events[1].contains("\"usage\""));
+        assert!(events[1].ends_with("\n\n"));
+        assert_eq!(events[2], "data: [DONE]\n\n");
+    }
+
+    #[test]
+    fn test_reframer_reassembles_event_split_across_chunks() {
+        // A single event split across two network reads is buffered until its
+        // terminator arrives, then emitted exactly once.
+        let events = reframe(&[b"data: {\"par", b"tial\":true}\n\n"]);
+        assert_eq!(events, vec!["data: {\"partial\":true}\n\n"]);
+    }
+
+    #[test]
+    fn test_reframer_flushes_trailing_event_without_terminator() {
+        // If the upstream ends without a final blank line, the buffered bytes
+        // must still be delivered (never dropped).
+        let events = reframe(&[b"data: [DONE]"]);
+        assert_eq!(events, vec!["data: [DONE]"]);
+    }
+
+    #[test]
+    fn test_reframer_handles_crlf_framing() {
+        let events = reframe(&[b"data: a\r\n\r\ndata: b\r\n\r\n"]);
+        assert_eq!(events, vec!["data: a\r\n\r\n", "data: b\r\n\r\n"]);
+    }
+
+    #[test]
+    fn test_reframer_preserves_bytes_under_arbitrary_chunking() {
+        // Whatever the chunk boundaries, the concatenation of all emitted events
+        // must equal the original byte stream exactly (content + order preserved).
+        let original = "data: {\"i\":0}\n\ndata: {\"i\":1}\n\ndata: {\"i\":2}\n\ndata: [DONE]\n\n";
+        let bytes = original.as_bytes();
+        // Re-chunk at every possible single split point and verify round-trip.
+        for split in 0..=bytes.len() {
+            let (a, b) = bytes.split_at(split);
+            let joined = reframe(&[a, b]).join("");
+            assert_eq!(joined, original, "byte preservation broke at split {}", split);
+        }
+    }
+
+    #[test]
+    fn test_reframer_done_event_is_isolated_for_load_detection() {
+        // Because [DONE] is emitted as its own event, the per-event
+        // `windows(12)` scan used for load release matches exactly one event.
+        let glued = b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n";
+        let events = reframe(&[glued]);
+        let done_events: Vec<_> = events
+            .iter()
+            .filter(|e| e.as_bytes().windows(12).any(|w| w == b"data: [DONE]"))
+            .collect();
+        assert_eq!(done_events.len(), 1);
+        assert_eq!(done_events[0], "data: [DONE]\n\n");
+    }
 
     fn create_test_regular_router() -> Router {
         // Create registries
