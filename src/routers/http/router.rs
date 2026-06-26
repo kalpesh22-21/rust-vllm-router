@@ -936,9 +936,8 @@ impl Router {
         //     Content-Type header on the raw-passthrough path, set them; reqwest
         //     derives Content-Length from the forwarded bytes)
         //   - Trace headers (propagate_trace_headers below injects fresh context)
-        //   - x-request-id (replaced below with a guaranteed-unique UUID so that
-        //     concurrent requests with the same client-supplied id cannot collide
-        //     inside vLLM's engine, which keys requests by request id)
+        //   - x-request-id (re-injected below: the client's value is honored when
+        //     present, otherwise a fresh UUID is generated)
         if let Some(headers) = headers {
             for (name, value) in headers {
                 if *name != CONTENT_TYPE
@@ -958,18 +957,21 @@ impl Router {
             request_builder = request_builder.header("X-data-parallel-rank", dp_rank.to_string());
         }
 
-        // Skip the client's x-request-id above and inject exactly one fresh,
-        // unique id here.  reqwest .header() appends (HeaderMap::append), so the
-        // skip in the copy loop above is what guarantees a single value arrives at
-        // the upstream worker.  A fresh uuid per attempt is intentional — reusing
-        // the same id across retries could make vLLM treat a retry as a duplicate
-        // in-flight request (vLLM keys engine slots by request id).
+        // The copy loop above skips the client's x-request-id so we can inject
+        // exactly one value here (reqwest .header() appends, so skipping avoids a
+        // duplicate). Honor the client-supplied id when present; otherwise mint a
+        // fresh UUID. When generated, the id is unique per attempt; when supplied
+        // by the client it is preserved as-is across retries.
         //
         // Note: otel_http::propagate_trace_headers / send_client_request only
         // injects traceparent / tracestate / baggage headers — it does NOT touch
         // x-request-id — so this is the sole place an x-request-id is added to
         // this builder.
-        request_builder = request_builder.header("x-request-id", Uuid::new_v4().to_string());
+        let request_id_value = match request_id {
+            Some(id) if !id.is_empty() => id.to_string(),
+            _ => Uuid::new_v4().to_string(),
+        };
+        request_builder = request_builder.header("x-request-id", request_id_value);
 
         let res = match otel_http::send_client_request(
             request_builder,

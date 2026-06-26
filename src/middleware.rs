@@ -124,12 +124,17 @@ where
         Box::pin(async move {
             let mut response = future.await?;
 
-            // Add request ID to response headers
-            response.headers_mut().insert(
-                "x-request-id",
-                HeaderValue::from_str(&request_id)
-                    .unwrap_or_else(|_| HeaderValue::from_static("invalid-request-id")),
-            );
+            // Add request ID to response headers only if the backend didn't
+            // already set one. This lets the upstream (vLLM) x-request-id pass
+            // through to the client; for non-proxied responses (health, errors,
+            // etc.) we fall back to the router's request-id.
+            if !response.headers().contains_key("x-request-id") {
+                response.headers_mut().insert(
+                    "x-request-id",
+                    HeaderValue::from_str(&request_id)
+                        .unwrap_or_else(|_| HeaderValue::from_static("invalid-request-id")),
+                );
+            }
 
             Ok(response)
         })

@@ -905,7 +905,7 @@ impl PDRouter {
                         };
 
                         // Execute the actual dual dispatch
-                        let response = self
+                        let mut response = self
                             .execute_dual_dispatch_internal(
                                 headers,
                                 json_request,
@@ -915,6 +915,18 @@ impl PDRouter {
                                 start_time,
                             )
                             .await;
+
+                        // Surface the prefill/decode workers that served this
+                        // request so callers can see the routing decision. Uses
+                        // the base URL (DP @rank suffix stripped).
+                        let (prefill_base, _) = super::dp_utils::parse_worker_url(prefill.url());
+                        let (decode_base, _) = super::dp_utils::parse_worker_url(decode.url());
+                        if let Ok(v) = HeaderValue::from_str(&prefill_base) {
+                            response.headers_mut().insert("x-prefill-url", v);
+                        }
+                        if let Ok(v) = HeaderValue::from_str(&decode_base) {
+                            response.headers_mut().insert("x-decode-url", v);
+                        }
 
                         // Record outcomes for circuit breakers
                         let _status = response.status();
@@ -1702,11 +1714,14 @@ impl PDRouter {
         if let Some(headers) = headers {
             for (name, value) in headers.iter() {
                 let name_lc = name.as_str().to_ascii_lowercase();
-                // Whitelist important end-to-end headers, skip hop-by-hop
+                // Whitelist important end-to-end headers, skip hop-by-hop.
+                // Includes session-identity headers so backends can do
+                // session-aware work (x-session-id, x-user-id, x-tenant-id, ...).
                 let forward = matches!(
                     name_lc.as_str(),
                     "authorization" | "x-request-id" | "x-correlation-id"
-                ) || name_lc.starts_with("x-request-id-");
+                ) || name_lc.starts_with("x-request-id-")
+                    || header_utils::SESSION_HEADER_NAMES.contains(&name_lc.as_str());
                 if forward {
                     if let Ok(val) = value.to_str() {
                         request = request.header(name, val);
